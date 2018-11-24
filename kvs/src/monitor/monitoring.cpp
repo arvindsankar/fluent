@@ -19,6 +19,7 @@
 
 unsigned kMemoryThreadCount;
 unsigned kEbsThreadCount;
+unsigned kMonitoringThreadCount;
 
 unsigned kDefaultGlobalMemoryReplication;
 unsigned kDefaultGlobalEbsReplication;
@@ -33,6 +34,31 @@ ZmqUtilInterface *kZmqUtil = &zmq_util;
 
 HashRingUtil hash_ring_util;
 HashRingUtilInterface *kHashRingUtil = &hash_ring_util;
+
+void clear_thread_stats(thread_stats& ts) {
+  ts.key_access_frequency.clear();
+  ts.key_access_summary.clear();
+  ts.memory_tier_storage.clear();
+  ts.ebs_tier_storage.clear();
+  ts.memory_tier_occupancy.clear();
+  ts.ebs_tier_occupancy.clear();
+  ts.ss.clear();
+  ts.user_latency.clear();
+  ts.user_throughput.clear();
+  ts.latency_miss_ratio_map.clear();
+}
+
+void collect_stats(std::shared_ptr<spdlog::logger> logger, 
+                  std::vector<KeyResponse> responses,
+                  unsigned rid, unsigned tid, thread_stats& ts, 
+                  unsigned server_monitoring_epoch) {
+  // collect internal statistics
+  collect_internal_stats(responses, logger, rid, kMonitoringThreadCount, tid, ts);
+  // collect external statistics
+  collect_external_stats(ts, logger);
+  // compute summary statistics
+  compute_summary_stats(ts, logger, server_monitoring_epoch);
+}
 
 int main(int argc, char *argv[]) {
   auto logger = spdlog::basic_logger_mt("monitoring_logger", "log.txt", true);
@@ -52,6 +78,7 @@ int main(int argc, char *argv[]) {
   YAML::Node threads = conf["threads"];
   kMemoryThreadCount = threads["memory"].as<unsigned>();
   kEbsThreadCount = threads["ebs"].as<unsigned>();
+  kMonitoringThreadCount = threads["monitoring"].as<unsigned>();
 
   YAML::Node replication = conf["replication"];
   kDefaultGlobalMemoryReplication = replication["memory"].as<unsigned>();
@@ -63,6 +90,8 @@ int main(int argc, char *argv[]) {
       kMemoryThreadCount, kDefaultGlobalMemoryReplication, kMemoryNodeCapacity);
   kTierDataMap[2] =
       TierData(kEbsThreadCount, kDefaultGlobalEbsReplication, kEbsNodeCapacity);
+
+  thread_stats agg_stats;
 
   // initialize hash ring maps
   std::unordered_map<unsigned, GlobalHashRing> global_hash_ring_map;
@@ -84,31 +113,31 @@ int main(int argc, char *argv[]) {
   unsigned ebs_node_number;
   // keep track of the keys' access by worker address
   std::unordered_map<Key, std::unordered_map<Address, unsigned>>
-      key_access_frequency;
+      key_access_frequency = agg_stats.key_access_frequency;
   // keep track of the keys' access summary
-  std::unordered_map<Key, unsigned> key_access_summary;
+  std::unordered_map<Key, unsigned> key_access_summary = agg_stats.key_access_summary;
   // keep track of the size of each key-value pair
-  std::unordered_map<Key, unsigned> key_size;
+  std::unordered_map<Key, unsigned> key_size = agg_stats.key_size;
   // keep track of memory tier storage consumption
-  StorageStat memory_tier_storage;
+  StorageStat memory_tier_storage = agg_stats.memory_tier_storage;
   // keep track of ebs tier storage consumption
-  StorageStat ebs_tier_storage;
+  StorageStat ebs_tier_storage = agg_stats.ebs_tier_storage;
   // keep track of memory tier thread occupancy
-  OccupancyStats memory_tier_occupancy;
+  OccupancyStats memory_tier_occupancy = agg_stats.memory_tier_occupancy;
   // keep track of ebs tier thread occupancy
-  OccupancyStats ebs_tier_occupancy;
+  OccupancyStats ebs_tier_occupancy = agg_stats.ebs_tier_occupancy;
   // keep track of memory tier hit
-  AccessStat memory_tier_access;
+  AccessStat memory_tier_access = agg_stats.memory_tier_access;
   // keep track of ebs tier hit
-  AccessStat ebs_tier_access;
+  AccessStat ebs_tier_access = agg_stats.ebs_tier_access;
   // keep track of some summary statistics
-  SummaryStats ss;
+  SummaryStats ss = agg_stats.ss;
   // keep track of user latency info
-  std::unordered_map<std::string, double> user_latency;
+  std::unordered_map<std::string, double> user_latency = agg_stats.user_latency;
   // keep track of user throughput info
-  std::unordered_map<std::string, double> user_throughput;
+  std::unordered_map<std::string, double> user_throughput = agg_stats.user_throughput;
   // used for adjusting the replication factors based on feedback from the user
-  std::unordered_map<Key, std::pair<double, unsigned>> latency_miss_ratio_map;
+  std::unordered_map<Key, std::pair<double, unsigned>> latency_miss_ratio_map = agg_stats.latency_miss_ratio_map;
 
   std::vector<Address> routing_address;
 
@@ -196,41 +225,45 @@ int main(int argc, char *argv[]) {
 
       memory_node_number = global_hash_ring_map[1].size() / kVirtualThreadNum;
       ebs_node_number = global_hash_ring_map[2].size() / kVirtualThreadNum;
+
       // clear stats
-      key_access_frequency.clear();
-      key_access_summary.clear();
+      clear_thread_stats(agg_stats);
 
-      memory_tier_storage.clear();
-      ebs_tier_storage.clear();
+      std::vector<KeyResponse> responses;
 
-      memory_tier_occupancy.clear();
-      ebs_tier_occupancy.clear();
+      get_key_responses(global_hash_ring_map, local_hash_ring_map, 
+        responses, pushers, mt, response_puller, rid);
 
-      ss.clear();
+      std::vector<thread_stats> ts_vec;
+      unsigned tid;
 
-      user_latency.clear();
-      user_throughput.clear();
-      latency_miss_ratio_map.clear();
+      /* Phase One: collect stats for each individual thread */
 
-      // collect internal statistics
-      collect_internal_stats(
-          global_hash_ring_map, local_hash_ring_map, pushers, mt,
-          response_puller, logger, rid, key_access_frequency, key_size,
-          memory_tier_storage, ebs_tier_storage, memory_tier_occupancy,
-          ebs_tier_occupancy, memory_tier_access, ebs_tier_access);
+      for (tid = 0; tid < kMonitoringThreadCount; tid++) {
+        thread_stats ts;
+        collect_stats(logger, responses, rid, tid, std::ref(ts), server_monitoring_epoch);
+        ts_vec.push_back(ts);
+      }
 
-      // compute summary statistics
-      compute_summary_stats(key_access_frequency, memory_tier_storage,
-                            ebs_tier_storage, memory_tier_occupancy,
-                            ebs_tier_occupancy, memory_tier_access,
-                            ebs_tier_access, key_access_summary, ss, logger,
-                            server_monitoring_epoch);
+      /* Phase Two: aggregate stats into the agg_stats object */
 
-      // collect external statistics
-      collect_external_stats(user_latency, user_throughput, ss, logger);
+      for (tid = 0; tid < ts_vec.size(); tid++) {
+        thread_stats ts = ts_vec.at(tid);
+
+        agg_stats.key_access_summary.insert(ts.key_access_summary.begin(), ts.key_access_summary.end());
+        agg_stats.key_access_frequency.insert(ts.key_access_frequency.begin(), ts.key_access_frequency.end());
+        agg_stats.key_size.insert(ts.key_size.begin(), ts.key_size.end());
+        agg_stats.memory_tier_storage.insert(ts.memory_tier_storage.begin(), ts.memory_tier_storage.end());
+        agg_stats.ebs_tier_storage.insert(ts.ebs_tier_storage.begin(), ts.ebs_tier_storage.end());
+        agg_stats.memory_tier_occupancy.insert(ts.memory_tier_occupancy.begin(), ts.memory_tier_occupancy.end());
+        agg_stats.ebs_tier_occupancy.insert(ts.ebs_tier_occupancy.begin(), ts.ebs_tier_occupancy.end());
+        agg_stats.memory_tier_access.insert(ts.memory_tier_access.begin(), ts.memory_tier_access.end());
+        agg_stats.ebs_tier_access.insert(ts.ebs_tier_access.begin(), ts.ebs_tier_access.end());
+        agg_stats.ss.aggregate(ts.ss);
+      }
 
       // initialize replication factor for new keys
-      for (const auto &key_access_pair : key_access_summary) {
+      for (const auto &key_access_pair : agg_stats.key_access_summary) {
         Key key = key_access_pair.first;
         if (!is_metadata(key) && placement.find(key) == placement.end()) {
           init_replication(placement, key);
@@ -238,22 +271,22 @@ int main(int argc, char *argv[]) {
       }
 
       // execute policies
-      storage_policy(logger, global_hash_ring_map, grace_start, ss,
+      storage_policy(logger, global_hash_ring_map, grace_start, agg_stats.ss,
                      memory_node_number, ebs_node_number, adding_memory_node,
                      adding_ebs_node, removing_ebs_node, management_address, mt,
                      departing_node_map, pushers);
 
       movement_policy(logger, global_hash_ring_map, local_hash_ring_map,
-                      grace_start, ss, memory_node_number, ebs_node_number,
+                      grace_start, agg_stats.ss, memory_node_number, ebs_node_number,
                       adding_memory_node, adding_ebs_node, management_address,
-                      placement, key_access_summary, key_size, mt, pushers,
+                      placement, agg_stats.key_access_summary, agg_stats.key_size, mt, pushers,
                       response_puller, routing_address, rid);
 
       slo_policy(logger, global_hash_ring_map, local_hash_ring_map, grace_start,
-                 ss, memory_node_number, adding_memory_node,
+                 agg_stats.ss, memory_node_number, adding_memory_node,
                  removing_memory_node, management_address, placement,
-                 key_access_summary, mt, departing_node_map, pushers,
-                 response_puller, routing_address, rid, latency_miss_ratio_map);
+                 agg_stats.key_access_summary, mt, departing_node_map, pushers,
+                 response_puller, routing_address, rid, agg_stats.latency_miss_ratio_map);
 
       report_start = std::chrono::system_clock::now();
     }

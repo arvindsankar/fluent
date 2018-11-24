@@ -15,17 +15,11 @@
 #include "monitor/monitoring_utils.hpp"
 #include "requests.hpp"
 
-void collect_internal_stats(
-    std::unordered_map<unsigned, GlobalHashRing>& global_hash_ring_map,
-    std::unordered_map<unsigned, LocalHashRing>& local_hash_ring_map,
-    SocketCache& pushers, MonitoringThread& mt, zmq::socket_t& response_puller,
-    std::shared_ptr<spdlog::logger> logger, unsigned& rid,
-    std::unordered_map<Key, std::unordered_map<Address, unsigned>>&
-        key_access_frequency,
-    std::unordered_map<Key, unsigned>& key_size,
-    StorageStat& memory_tier_storage, StorageStat& ebs_tier_storage,
-    OccupancyStats& memory_tier_occupancy, OccupancyStats& ebs_tier_occupancy,
-    AccessStat& memory_tier_access, AccessStat& ebs_tier_access) {
+void get_key_responses(std::unordered_map<unsigned, GlobalHashRing>& global_hash_ring_map,
+    std::unordered_map<unsigned, LocalHashRing>& local_hash_ring_map, std::vector<KeyResponse>& responses, 
+    SocketCache& pushers, MonitoringThread& mt,
+    zmq::socket_t& response_puller, unsigned& rid) {
+
   std::unordered_map<Address, KeyRequest> addr_request_map;
 
   for (const auto& global_pair : global_hash_ring_map) {
@@ -57,10 +51,32 @@ void collect_internal_stats(
     auto res = send_request<KeyRequest, KeyResponse>(
         addr_request_pair.second, pushers[addr_request_pair.first],
         response_puller, succeed);
-
     if (succeed) {
+      responses.push_back(res);
+    }
+  }
+}
+
+void collect_internal_stats(std::vector<KeyResponse> responses,
+    std::shared_ptr<spdlog::logger> logger, unsigned& rid,
+    unsigned thread_count, unsigned tid, thread_stats& ts) {
+
+  std::unordered_map<Key, std::unordered_map<Address, unsigned>>&
+      key_access_frequency = ts.key_access_frequency;
+  std::unordered_map<Key, unsigned>& key_size = ts.key_size;
+  StorageStat& memory_tier_storage = ts.memory_tier_storage;
+  StorageStat& ebs_tier_storage = ts.ebs_tier_storage;
+  OccupancyStats& memory_tier_occupancy = ts.memory_tier_occupancy;
+  OccupancyStats& ebs_tier_occupancy = ts.ebs_tier_occupancy;
+  AccessStat& memory_tier_access = ts.memory_tier_access;
+  AccessStat& ebs_tier_access = ts.ebs_tier_access;
+
+  for (int i = 0; i < responses.size(); i++) {
+    if (i % thread_count == tid) {
+      auto res = responses.at(i);
       for (const KeyTuple& tuple : res.tuples()) {
         if (tuple.error() == 0) {
+          logger->info(tuple.key() + " " + std::to_string(i % thread_count));
           std::vector<std::string> tokens = split_metadata_key(tuple.key());
 
           Address ip_pair = tokens[1] + "/" + tokens[2];
@@ -110,25 +126,36 @@ void collect_internal_stats(
           logger->error("Hash ring is inconsistent for key {}.", tuple.key());
         }
       }
-    } else {
-      logger->error("Request timed out.");
-      continue;
     }
   }
 }
 
-void compute_summary_stats(
-    std::unordered_map<Key, std::unordered_map<Address, unsigned>>&
-        key_access_frequency,
-    StorageStat& memory_tier_storage, StorageStat& ebs_tier_storage,
-    OccupancyStats& memory_tier_occupancy, OccupancyStats& ebs_tier_occupancy,
-    AccessStat& memory_tier_access, AccessStat& ebs_tier_access,
-    std::unordered_map<Key, unsigned>& key_access_summary, SummaryStats& ss,
+void compute_summary_stats(thread_stats& ts,
     std::shared_ptr<spdlog::logger> logger, unsigned& server_monitoring_epoch) {
+
+  std::unordered_map<Key, std::unordered_map<Address, unsigned>>&
+      key_access_frequency = ts.key_access_frequency;
+  std::unordered_map<Key, unsigned>& key_access_summary = ts.key_access_summary; 
+  SummaryStats& ss = ts.ss;
+  
+  StorageStat& memory_tier_storage = ts.memory_tier_storage; 
+  StorageStat& ebs_tier_storage = ts.ebs_tier_storage;
+  
+  OccupancyStats& memory_tier_occupancy = ts.memory_tier_occupancy;
+  OccupancyStats& ebs_tier_occupancy = ts.ebs_tier_occupancy;
+  
+  AccessStat& memory_tier_access = ts.memory_tier_access;
+  AccessStat& ebs_tier_access = ts.ebs_tier_access;
+  
+  ss.memory_node_capacity = (double)kTierDataMap[1].node_capacity_;
+  ss.ebs_node_capacity = (double)kTierDataMap[2].node_capacity_;
+
   // compute key access summary
   unsigned cnt = 0;
   double mean = 0;
   double ms = 0;
+
+  logger->info("compute_summary_stats " + std::to_string(key_access_frequency.size()));
 
   for (const auto& key_access_pair : key_access_frequency) {
     Key key = key_access_pair.first;
@@ -151,11 +178,16 @@ void compute_summary_stats(
     }
   }
 
+  ss.key_access_cnt = cnt;
   ss.key_access_mean = mean;
-  ss.key_access_std = sqrt((double)ms / cnt);
+  if (cnt > 0) {
+    ss.key_access_std = sqrt((double)ms / cnt);
+  } else {
+    ss.key_access_std = 0; 
+  }
 
-  logger->info("Access: mean={}, std={}", ss.key_access_mean,
-               ss.key_access_std);
+  logger->info("Access: cnt={} mean={}, std={}", ss.key_access_cnt,
+               ss.key_access_mean, ss.key_access_std);
 
   // compute tier access summary
   for (const auto& memory_access : memory_tier_access) {
@@ -217,9 +249,10 @@ void compute_summary_stats(
   }
 
   if (m_count != 0) {
+    ss.total_memory_count = (double)m_count * kTierDataMap[1].node_capacity_;
     ss.avg_memory_consumption_percentage =
         (double)ss.total_memory_consumption /
-        ((double)m_count * kTierDataMap[1].node_capacity_);
+        (ss.total_memory_count);
     logger->info("Average memory node consumption is {}.",
                  ss.avg_memory_consumption_percentage);
     logger->info("Max memory node consumption is {}.",
@@ -227,9 +260,10 @@ void compute_summary_stats(
   }
 
   if (e_count != 0) {
+    ss.total_ebs_count = (double)e_count * kTierDataMap[2].node_capacity_;
     ss.avg_ebs_consumption_percentage =
         (double)ss.total_ebs_consumption /
-        ((double)e_count * kTierDataMap[2].node_capacity_);
+        (ss.total_ebs_count);
     logger->info("Average EBS node consumption is {}.",
                  ss.avg_ebs_consumption_percentage);
     logger->info("Max EBS node consumption is {}.",
@@ -285,7 +319,14 @@ void compute_summary_stats(
     count += 1;
   }
 
-  ss.avg_memory_occupancy = sum_memory_occupancy / count;
+  ss.sum_memory_occupancy = sum_memory_occupancy;
+  ss.cnt_memory_occupancy = count;
+  if (count > 0) {
+    ss.avg_memory_occupancy = sum_memory_occupancy / count;
+  } else {
+    ss.avg_memory_occupancy = 0;
+  }
+
   logger->info("Max memory node occupancy is {}.",
                std::to_string(ss.max_memory_occupancy));
   logger->info("Min memory node occupancy is {}.",
@@ -326,7 +367,11 @@ void compute_summary_stats(
     count += 1;
   }
 
-  ss.avg_ebs_occupancy = sum_ebs_occupancy / count;
+  if (count > 0) {
+    ss.avg_ebs_occupancy = sum_ebs_occupancy / count;
+  } else {
+    ss.avg_ebs_occupancy = 0;
+  }
   logger->info("Max EBS node occupancy is {}.",
                std::to_string(ss.max_ebs_occupancy));
   logger->info("Min EBS node occupancy is {}.",
@@ -335,10 +380,12 @@ void compute_summary_stats(
                std::to_string(ss.avg_ebs_occupancy));
 }
 
-void collect_external_stats(
-    std::unordered_map<std::string, double>& user_latency,
-    std::unordered_map<std::string, double>& user_throughput, SummaryStats& ss,
-    std::shared_ptr<spdlog::logger> logger) {
+void collect_external_stats(thread_stats& ts, std::shared_ptr<spdlog::logger> logger) {
+
+  std::unordered_map<std::string, double>& user_latency = ts.user_latency;
+  std::unordered_map<std::string, double>& user_throughput = ts.user_throughput;
+  SummaryStats& ss = ts.ss;
+
   // gather latency info
   if (user_latency.size() > 0) {
     // compute latency from users
@@ -350,6 +397,8 @@ void collect_external_stats(
       count += 1;
     }
 
+    ss.sum_latency = sum_latency;
+    ss.cnt_latency = count;
     ss.avg_latency = sum_latency / count;
   }
 
