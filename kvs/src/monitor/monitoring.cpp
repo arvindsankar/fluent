@@ -49,15 +49,18 @@ void clear_thread_stats(thread_stats& ts) {
 }
 
 void collect_stats(std::shared_ptr<spdlog::logger> logger, 
-                  std::vector<KeyResponse> responses,
-                  unsigned rid, unsigned tid, thread_stats& ts, 
-                  unsigned server_monitoring_epoch) {
+                   std::vector<KeyResponse> responses,
+                   thread_stats* t_arr,
+                   unsigned rid, unsigned tid, 
+                   unsigned server_monitoring_epoch) {
+  thread_stats ts;
   // collect internal statistics
   collect_internal_stats(responses, logger, rid, kMonitoringThreadCount, tid, ts);
   // collect external statistics
   collect_external_stats(ts, logger);
   // compute summary statistics
   compute_summary_stats(ts, logger, server_monitoring_epoch);
+  t_arr[tid] = ts;
 }
 
 int main(int argc, char *argv[]) {
@@ -234,22 +237,27 @@ int main(int argc, char *argv[]) {
       get_key_responses(global_hash_ring_map, local_hash_ring_map, 
         responses, pushers, mt, response_puller, rid);
 
-      std::vector<thread_stats> ts_vec;
       unsigned tid;
+      std::vector<std::thread> threads;
+
+      // this needs to be kMonitoringThreadCount, but won't compile if I do size = kMonitoringThreadCount. 
+      const int size = 4; 
+      thread_stats t_arr[size];
 
       /* Phase One: collect stats for each individual thread */
 
       for (tid = 0; tid < kMonitoringThreadCount; tid++) {
-        thread_stats ts;
-        collect_stats(logger, responses, rid, tid, std::ref(ts), server_monitoring_epoch);
-        ts_vec.push_back(ts);
+        threads.push_back(std::thread(collect_stats, logger, responses, t_arr, rid, tid, server_monitoring_epoch));
+      }
+
+      for (tid = 0; tid < kMonitoringThreadCount; tid++) {
+        threads[tid].join();
       }
 
       /* Phase Two: aggregate stats into the agg_stats object */
 
-      for (tid = 0; tid < ts_vec.size(); tid++) {
-        thread_stats ts = ts_vec.at(tid);
-
+      for (tid = 0; tid < kMonitoringThreadCount; tid++) {
+        thread_stats ts = t_arr[tid];
         agg_stats.key_access_summary.insert(ts.key_access_summary.begin(), ts.key_access_summary.end());
         agg_stats.key_access_frequency.insert(ts.key_access_frequency.begin(), ts.key_access_frequency.end());
         agg_stats.key_size.insert(ts.key_size.begin(), ts.key_size.end());
